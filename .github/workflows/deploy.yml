@@ -1,0 +1,21 @@
+#When we will push to github then this actions automate.
+name: Java CI/CD with Docker
+
+on:
+  push:
+    branches: main
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+	- name: Checkout the sourcecode
+      uses: actions/checkout@v4
+    - name: Set up JDK 21
+      uses: actions/setup-java@v4
+      with:
+        java-version: '21'
+        distribution: 'temurin'
+ 
