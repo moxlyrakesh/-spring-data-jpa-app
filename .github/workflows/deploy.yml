@@ -1,10 +1,10 @@
+```yaml
 name: Java CI/CD with Docker
 
 on:
   push:
     branches:
       - main
-
   pull_request:
     branches:
       - main
@@ -13,6 +13,7 @@ env:
   AWS_REGION: ap-south-1
   ECR_REPOSITORY: codingcure/ecommerce-service
   CONTAINER_NAME: ecommerce-service
+  EC2_SECURITY_GROUP_ID: sg-0f511cb9c8c4036b0
 
 jobs:
   build:
@@ -33,6 +34,7 @@ jobs:
         run: mvn clean package -DskipTests
 
       - name: Configure AWS credentials
+        if: github.event_name == 'push'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -40,38 +42,71 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
+        if: github.event_name == 'push'
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, tag, and push image to Amazon ECR
+      - name: Build and push Docker image
+        if: github.event_name == 'push'
         id: build-image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: latest
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" .
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Temporarily allow GitHub runner SSH
+        if: github.event_name == 'push'
+        id: allow-ssh
+        run: |
+          RUNNER_IP=$(curl -fsS https://checkip.amazonaws.com | tr -d '\r\n')
+          echo "GitHub runner IP: $RUNNER_IP"
+
+          RULE_ID=$(aws ec2 authorize-security-group-ingress \
+            --group-id "$EC2_SECURITY_GROUP_ID" \
+            --protocol tcp \
+            --port 22 \
+            --cidr "$RUNNER_IP/32" \
+            --query 'SecurityGroupRules[0].SecurityGroupRuleId' \
+            --output text)
+
+          echo "rule_id=$RULE_ID" >> "$GITHUB_OUTPUT"
 
       - name: Deploy to EC2
+        if: github.event_name == 'push'
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ec2-user
           key: ${{ secrets.EC2_SSH_KEY }}
+          port: 22
+          timeout: 60s
+          command_timeout: 10m
           script: |
-            aws ecr get-login-password --region ${{ env.AWS_REGION }} \
-              | docker login --username AWS --password-stdin ${{ steps.login-ecr.outputs.registry }}
+            set -e
 
-            # Pull latest image
+            aws ecr get-login-password --region ${{ env.AWS_REGION }} \
+              | docker login --username AWS --password-stdin \
+                ${{ steps.login-ecr.outputs.registry }}
+
             docker pull ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
 
-            # Stop old container (if running)
             docker stop ${{ env.CONTAINER_NAME }} || true
             docker rm ${{ env.CONTAINER_NAME }} || true
 
-            # Run new container
             docker run -d \
+              --restart unless-stopped \
               -p 80:8080 \
               --name ${{ env.CONTAINER_NAME }} \
               ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+
+      - name: Remove temporary SSH rule
+        if: ${{ always() && github.event_name == 'push' && steps.allow-ssh.outputs.rule_id != '' }}
+        env:
+          RULE_ID: ${{ steps.allow-ssh.outputs.rule_id }}
+        run: |
+          aws ec2 revoke-security-group-ingress \
+            --group-id "$EC2_SECURITY_GROUP_ID" \
+            --security-group-rule-ids "$RULE_ID"
